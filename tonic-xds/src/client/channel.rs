@@ -1352,6 +1352,81 @@ mod tests {
         }
     }
 
+    /// A cluster that leaves the cache and comes back drops its old endpoints
+    /// and serves the endpoints it was re-added with.
+    #[tokio::test]
+    async fn test_xds_channel_recovers_cluster_after_remove_and_readd() {
+        for backend in LB_BACKENDS {
+            recovers_cluster_after_remove_and_readd(backend).await;
+        }
+    }
+
+    async fn recovers_cluster_after_remove_and_readd(backend: LbBackend) {
+        let cluster_name = "test-cluster";
+        let (_, servers) = setup_grpc_servers(2).await;
+
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config(cluster_name));
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(
+            cluster_name,
+            make_test_endpoints(cluster_name, &servers[..1]),
+        );
+
+        let channel = build_xds_channel_from_cache(&cache, backend);
+        let mut client = GreeterClient::new(channel.clone());
+        let first = client
+            .say_hello(HelloRequest {
+                name: "before-removal".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            first.into_inner().message.starts_with("server-0:"),
+            "{backend:?}",
+        );
+
+        cache.remove_cluster(cluster_name);
+        cache.remove_endpoints(cluster_name);
+        cache.update_cluster(cluster_name, make_test_cluster(cluster_name));
+        cache.update_endpoints(
+            cluster_name,
+            make_test_endpoints(cluster_name, &servers[1..]),
+        );
+
+        // Background tasks apply the removal and re-add; until then requests
+        // can still reach the old endpoint.
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                let response = client
+                    .say_hello(HelloRequest {
+                        name: "after-readd".to_string(),
+                    })
+                    .await;
+                if response.is_ok_and(|r| r.into_inner().message.starts_with("server-1:")) {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{backend:?}: re-added cluster never reached its endpoints"));
+
+        let (successful, error_types, server_counts) =
+            send_grpc_requests(GreeterClient::new(channel), 50).await;
+        assert_eq!(successful, 50, "{backend:?}: {error_types:?}");
+        assert_eq!(
+            server_counts.keys().collect::<Vec<_>>(),
+            ["server-1"],
+            "{backend:?}: the removed endpoint should get no traffic",
+        );
+
+        for server in servers {
+            let _ = server.shutdown.send(());
+            let _ = server.handle.await;
+        }
+    }
+
     #[test]
     fn config_stores_call_credentials() {
         #[derive(Debug)]
